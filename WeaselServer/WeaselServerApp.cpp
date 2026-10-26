@@ -33,7 +33,7 @@ int WeaselServerApp::Run() {
     win_sparkle_set_lang("en");
   win_sparkle_init();
   LOG(INFO) << "creating candidate UI";
-  if (!m_ui.Create(m_server.GetHWnd())) {
+  if (!m_ui.CreateAsyncServer(m_server.GetHWnd())) {
     LOG(ERROR) << "failed to create candidate UI";
     return -1;
   }

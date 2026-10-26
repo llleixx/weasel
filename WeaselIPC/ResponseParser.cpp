@@ -2,19 +2,28 @@
 #include <StringAlgorithm.hpp>
 #include <WeaselIPC.h>
 #include "Deserializer.h"
+#include <ServerUIRevision.h>
 
 using namespace weasel;
+
+bool ResponseSnapshot::Parse(LPWSTR buffer, UINT length) {
+  ResponseParser parser(&commit, &context, &status, &config, &style,
+                        &ui_revision);
+  return parser(buffer, length);
+}
 
 ResponseParser::ResponseParser(std::wstring* commit,
                                Context* context,
                                Status* status,
                                Config* config,
-                               UIStyle* style)
+                               UIStyle* style,
+                               DWORD* ui_revision)
     : p_commit(commit),
       p_context(context),
       p_status(status),
       p_config(config),
-      p_style(style) {
+      p_style(style),
+      p_ui_revision(ui_revision) {
   Deserializer::Initialize(this);
 }
 
@@ -39,6 +48,11 @@ void ResponseParser::Feed(const std::wstring& line) {
   // ignore blank lines and comments
   if (line.empty() || line.find_first_of(L'#') == 0)
     return;
+
+  if (p_ui_revision && line.compare(0, 12, L"ui_revision=") == 0) {
+    ParseServerUIRevision(line.substr(12), *p_ui_revision);
+    return;
+  }
 
   Deserializer::KeyType key;
   std::wstring value;

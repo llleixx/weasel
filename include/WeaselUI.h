@@ -22,12 +22,30 @@ enum ClientCapabilities {
 };
 
 class UIImpl;
+class AsyncServerUI;
 class UI {
  public:
+  class UpdateBatch {
+   public:
+    explicit UpdateBatch(UI& ui);
+    ~UpdateBatch();
+    UpdateBatch(const UpdateBatch&) = delete;
+    UpdateBatch& operator=(const UpdateBatch&) = delete;
+
+   private:
+    UI& ui_;
+  };
   UI();
   virtual ~UI();
   // 创建输入法界面
   bool Create(HWND parent, bool preview_mode = false);
+  // The server keeps a data-only model on the IPC thread and a separate
+  // presenter on its window thread. Publishing never waits for painting.
+  bool CreateAsyncServer(HWND parent);
+  void SetLifetimeWindow(HWND window) { lifetime_window_ = window; }
+  void SetLayoutCallback(std::function<void(bool, bool)> callback) {
+    layout_callback_ = std::move(callback);
+  }
   // 销毁界面
   void Destroy(bool full = false);
   // 界面显隐
@@ -57,6 +75,10 @@ class UI {
   HWND hwnd();
 
  private:
+  friend class AsyncServerUI;
+  the<AsyncServerUI> async_;
+  HWND lifetime_window_ = nullptr;
+  std::function<void(bool, bool)> layout_callback_;
   the<UIImpl> pimpl_;
   Context ctx_;
   Status status_;

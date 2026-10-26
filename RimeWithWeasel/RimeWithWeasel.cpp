@@ -4,6 +4,7 @@
 #include <WeaselConstants.h>
 #include <WeaselStyleColor.h>
 #include <WeaselUtility.h>
+#include <ResponseParser.h>
 
 #include <filesystem>
 #include <map>
@@ -210,14 +211,17 @@ DWORD RimeWithWeaselHandler::AddSession(LPWSTR buffer, EatLine eat) {
     _Respond(ipc_id, eat);
   }
   add_session = true;
+  if (!m_active_session)
+    m_active_session = ipc_id;
   _UpdateUI(ipc_id);
   add_session = false;
-  m_active_session = ipc_id;
   return ipc_id;
 }
 
 DWORD RimeWithWeaselHandler::RemoveSession(WeaselSessionId ipc_id) {
-  if (m_ui)
+  if (!m_session_status_map.count(ipc_id))
+    return 0;
+  if (m_ui && m_active_session == ipc_id)
     m_ui->Hide();
   if (m_disabled)
     return 0;
@@ -225,7 +229,8 @@ DWORD RimeWithWeaselHandler::RemoveSession(WeaselSessionId ipc_id) {
   // TODO: force committing? otherwise current composition would be lost
   rime_api->destroy_session(to_session_id(ipc_id));
   m_session_status_map.erase(ipc_id);
-  m_active_session = 0;
+  if (m_active_session == ipc_id)
+    m_active_session = 0;
   return 0;
 }
 
@@ -288,8 +293,8 @@ BOOL RimeWithWeaselHandler::ProcessKeyEvent(KeyEvent keyEvent,
     }
   }
   _Respond(ipc_id, eat);
-  _UpdateUI(ipc_id);
   m_active_session = ipc_id;
+  _UpdateUI(ipc_id);
   return (BOOL)handled;
 }
 
@@ -299,7 +304,6 @@ void RimeWithWeaselHandler::CommitComposition(WeaselSessionId ipc_id) {
     return;
   rime_api->commit_composition(to_session_id(ipc_id));
   _UpdateUI(ipc_id);
-  m_active_session = ipc_id;
 }
 
 void RimeWithWeaselHandler::ClearComposition(WeaselSessionId ipc_id) {
@@ -308,7 +312,6 @@ void RimeWithWeaselHandler::ClearComposition(WeaselSessionId ipc_id) {
     return;
   rime_api->clear_composition(to_session_id(ipc_id));
   _UpdateUI(ipc_id);
-  m_active_session = ipc_id;
 }
 
 void RimeWithWeaselHandler::SelectCandidateOnCurrentPage(
@@ -346,16 +349,18 @@ bool RimeWithWeaselHandler::ChangePage(bool backward,
 }
 
 void RimeWithWeaselHandler::FocusIn(DWORD client_caps, WeaselSessionId ipc_id) {
-  DLOG(INFO) << "Focus in: ipc_id = " << ipc_id
-             << ", client_caps = " << client_caps;
-  if (m_disabled)
+  if (m_disabled || !FindSession(ipc_id))
     return;
-  _UpdateUI(ipc_id);
   m_active_session = ipc_id;
+  _UpdateUI(ipc_id);
 }
 
 void RimeWithWeaselHandler::FocusOut(DWORD param, WeaselSessionId ipc_id) {
-  DLOG(INFO) << "Focus out: ipc_id = " << ipc_id;
+  auto it = m_session_status_map.find(ipc_id);
+  if (it != m_session_status_map.end())
+    it->second.ui_token = 0;
+  if (m_active_session != ipc_id)
+    return;
   if (m_ui)
     m_ui->Hide();
   m_active_session = 0;
@@ -365,17 +370,14 @@ void RimeWithWeaselHandler::FocusOut(DWORD param, WeaselSessionId ipc_id) {
 
 void RimeWithWeaselHandler::UpdateInputPosition(RECT const& rc,
                                                 WeaselSessionId ipc_id) {
-  DLOG(INFO) << "Update input position: (" << rc.left << ", " << rc.top
-             << "), ipc_id = " << ipc_id
-             << ", m_active_session = " << m_active_session;
-  if (m_ui)
-    m_ui->UpdateInputPosition(rc);
-  if (m_disabled)
+  auto it = m_session_status_map.find(ipc_id);
+  if (m_disabled || it == m_session_status_map.end())
     return;
-  if (m_active_session != ipc_id) {
-    _UpdateUI(ipc_id);
-    m_active_session = ipc_id;
-  }
+  it->second.input_position = rc;
+  it->second.has_input_position = true;
+  if (m_ui && m_active_session == ipc_id &&
+      (!it->second.ui_callback || !it->second.ui_revision.pending()))
+    m_ui->UpdateInputPosition(rc);
 }
 
 std::string RimeWithWeaselHandler::m_message_type;
@@ -523,9 +525,11 @@ bool RimeWithWeaselHandler::_IsDeployerRunning() {
 }
 
 void RimeWithWeaselHandler::_UpdateUI(WeaselSessionId ipc_id) {
-  // if m_ui nullptr, _UpdateUI meaningless
-  if (!m_ui)
+  // Late updates from an unfocused document must not replace the shared
+  // presenter's content, owner, position or notification callbacks.
+  if (!m_ui || (ipc_id && m_active_session != ipc_id))
     return;
+  UI::UpdateBatch batch(*m_ui);
 
   Status& weasel_status = m_ui->status();
   Context weasel_context;
@@ -543,7 +547,62 @@ void RimeWithWeaselHandler::_UpdateUI(WeaselSessionId ipc_id) {
   else
     session_status.style.client_caps &= ~INLINE_PREEDIT_CAPABLE;
 
-  if (!_ShowMessage(weasel_context, weasel_status)) {
+  // The client acknowledges this response only after its caret extent is ready.
+  // Never combine a newer engine response with an older client token.
+  if (session_status.ui_callback && weasel_status.composing &&
+      session_status.ui_revision.pending())
+    return;
+
+  m_ui->style() = session_status.style;
+  m_ui->SetLifetimeWindow(session_status.ui_callback);
+  m_ui->SetUICallBack({});
+  m_ui->SetLayoutCallback({});
+  if (session_status.has_input_position)
+    m_ui->UpdateInputPosition(session_status.input_position);
+  if (session_status.ui_callback && weasel_status.composing) {
+    const HWND callback = session_status.ui_callback;
+    const DWORD token = session_status.ui_token;
+    m_ui->SetLayoutCallback([callback, token](bool reversed, bool visible) {
+      if (token)
+        PostMessage(
+            callback, WM_WEASEL_UI_CALLBACK, token,
+            ((static_cast<DWORD>(reversed) | (static_cast<DWORD>(visible) << 1))
+             << 8) |
+                UI_LAYOUT);
+    });
+    m_ui->SetUICallBack(
+        [callback, token](size_t* sel, size_t* hov, bool* next, bool* scroll) {
+          if (!token || !IsWindow(callback))
+            return;
+          DWORD action = 0, value = 0;
+          if (sel) {
+            action = UI_SELECT;
+            value = static_cast<DWORD>(*sel);
+          } else if (hov) {
+            action = UI_HOVER;
+            value = static_cast<DWORD>(*hov);
+          } else if (next) {
+            action = UI_PAGE;
+            value = *next;
+          } else if (scroll) {
+            action = UI_SCROLL;
+            value = *scroll;
+          }
+          if (action && value < 0x1000000)
+            PostMessage(callback, WM_WEASEL_UI_CALLBACK, token,
+                        (value << 8) | action);
+        });
+    // A TSF host may draw candidates itself. Suppress our own UI until
+    // BeginUIElement/Show explicitly grants it, including notifications.
+    weasel_context = session_status.ui_context;
+    m_ui->Update(weasel_context, weasel_status);
+    if (token && weasel_status.composing)
+      m_ui->Show();
+    else
+      m_ui->Hide();
+  } else if (!_ShowMessage(weasel_context, weasel_status)) {
+    m_ui->SetUICallBack({});
+    m_ui->SetLayoutCallback({});
     m_ui->Hide();
     m_ui->Update(weasel_context, weasel_status);
   }
@@ -557,6 +616,48 @@ void RimeWithWeaselHandler::_UpdateUI(WeaselSessionId ipc_id) {
     m_message_label.clear();
     m_option_name.clear();
   }
+}
+
+DWORD RimeWithWeaselHandler::EnableServerUI(HWND callback, DWORD ipc_id) {
+  auto it = m_session_status_map.find(ipc_id);
+  wchar_t name[80]{};
+  if (it == m_session_status_map.end() || !IsWindow(callback) ||
+      !GetClassName(callback, name, 80) ||
+      wcscmp(name, WEASEL_UI_CALLBACK_CLASS) != 0)
+    return 0;
+  // A lower-integrity server cannot post to an elevated TSF window. Keep
+  // local UI in that case rather than accepting an unusable mouse channel.
+  if (!PostMessage(callback, WM_WEASEL_UI_CALLBACK, 0, 0))
+    return 0;
+  it->second.ui_callback = callback;
+  it->second.ui_token = 0;
+  return WEASEL_SERVER_UI_V2;
+}
+
+bool RimeWithWeaselHandler::ShowServerUI(DWORD token,
+                                         DWORD revision,
+                                         DWORD ipc_id) {
+  auto it = m_session_status_map.find(ipc_id);
+  if (m_disabled || it == m_session_status_map.end() ||
+      !it->second.ui_callback || (token && m_active_session != ipc_id))
+    return false;
+  if (token && !it->second.ui_revision.Acknowledge(revision))
+    return false;
+  it->second.ui_token = token;
+  if (token) {
+    _UpdateUI(ipc_id);
+  } else if (m_active_session == ipc_id) {
+    m_ui->Hide();
+  }
+  return true;
+}
+
+bool RimeWithWeaselHandler::ReadState(DWORD ipc_id, EatLine eat) {
+  if (m_disabled || !m_session_status_map.count(ipc_id))
+    return false;
+  bool result = _Respond(ipc_id, eat);
+  _UpdateUI(ipc_id);
+  return result;
 }
 
 void RimeWithWeaselHandler::_LoadSchemaSpecificSettings(
@@ -934,10 +1035,23 @@ bool RimeWithWeaselHandler::_Respond(WeaselSessionId ipc_id, EatLine eat) {
     }
     header = std::wstring(L"action=") + u8tow(actionList) + L"\n";
   }
+  if (session_status.ui_callback)
+    header += L"ui_revision=" +
+              std::to_wstring(session_status.ui_revision.Advance()) + L"\n";
   if (!eat(header))
     return false;
 
   body.append(L".\n");
+  if (session_status.ui_callback) {
+    // Use exactly the context sent to TSF, including preedit preview mode
+    // and escaped candidate strings, without fetching/consuming a commit twice.
+    session_status.ui_context.clear();
+    Config config;
+    ResponseParser parser(nullptr, &session_status.ui_context, nullptr,
+                          &config);
+    auto response = header + body;
+    parser(response.data(), static_cast<UINT>(response.size()));
+  }
   if (!eat(body))
     return false;
 

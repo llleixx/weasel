@@ -32,12 +32,21 @@ enum WEASEL_IPC_COMMAND {
   WEASEL_IPC_SELECT_CANDIDATE_ON_CURRENT_PAGE,
   WEASEL_IPC_HIGHLIGHT_CANDIDATE_ON_CURRENT_PAGE,
   WEASEL_IPC_CHANGE_PAGE,
+  WEASEL_IPC_ENABLE_SERVER_UI,
+  WEASEL_IPC_SHOW_SERVER_UI,
+  WEASEL_IPC_READ_STATE,
+  WEASEL_IPC_UPDATE_INPUT_POS_EX,
   WEASEL_IPC_LAST_COMMAND
 };
 
 // Posted by WeaselTrayIcon to the server window so that Shell_NotifyIcon runs
 // on the server message thread instead of a pipe worker thread.
 #define WM_WEASEL_SERVICE_NOTIFY (WEASEL_IPC_LAST_COMMAND + 200)
+
+#define WEASEL_SERVER_UI_V2 0x57554932
+#define WEASEL_UI_CALLBACK_CLASS L"WeaselCandidateCallback.v2"
+#define WM_WEASEL_UI_CALLBACK (WM_APP + 310)
+enum WeaselUIAction { UI_SELECT = 1, UI_HOVER, UI_PAGE, UI_SCROLL, UI_LAYOUT };
 
 namespace weasel {
 struct PipeMessage {
@@ -85,6 +94,11 @@ struct RequestHandler {
   virtual void EndMaintenance() {}
   virtual void SetOption(DWORD session_id, const std::string& opt, bool val) {}
   virtual void UpdateColorTheme(BOOL darkMode) {}
+  virtual DWORD EnableServerUI(HWND callback, DWORD session_id) { return 0; }
+  virtual bool ShowServerUI(DWORD token, DWORD revision, DWORD session_id) {
+    return false;
+  }
+  virtual bool ReadState(DWORD session_id, EatLine eat) { return false; }
 };
 
 // 處理server端回應之物件
@@ -146,6 +160,9 @@ class Client {
   void TrayCommand(UINT menuId);
   // 读取server返回的数据
   bool GetResponseData(ResponseHandler handler);
+  bool EnableServerUI(HWND callback);
+  bool ShowServerUI(DWORD token, DWORD revision);
+  bool ReadState();
 
  private:
   ClientImpl* m_pImpl;

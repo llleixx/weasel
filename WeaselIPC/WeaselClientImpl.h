@@ -28,6 +28,9 @@ class ClientImpl {
   void FocusOut();
   void TrayCommand(UINT menuId);
   bool GetResponseData(ResponseHandler const& handler);
+  bool EnableServerUI(HWND callback);
+  bool ShowServerUI(DWORD token, DWORD revision);
+  bool ReadState();
 
  protected:
   void _InitializeClientInfo();
@@ -42,6 +45,7 @@ class ClientImpl {
   UINT session_id;
   std::wstring app_name;
   bool is_ime;
+  bool server_ui = false;
 
   PipeChannel<PipeMessage> channel;
 };

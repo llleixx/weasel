@@ -9,11 +9,119 @@ using namespace std;
 using namespace weasel;
 
 CCandidateList::CCandidateList(com_ptr<WeaselTSF> pTextService)
-    : _ui(make_unique<UI>()), _tsf(pTextService), _pbShow(TRUE) {
+    : _ui(make_unique<UI>()), _tsf(pTextService) {
   _cRef = 1;
 }
 
-CCandidateList::~CCandidateList() {}
+CCandidateList::~CCandidateList() {
+  _DestroyCallbackWindow();
+}
+
+void CCandidateList::ConnectServerUI() {
+  _serverUI = false;
+  _shown = false;
+  _sentToken = 0;
+  _remoteShown = false;
+  _remoteReposition = false;
+  _InvalidateUIActions();
+  // Immersive hosts require the candidate window to be owned by their view.
+  // Retain that existing path; desktop clients negotiate server rendering.
+  if (_tsf->isImmersive())
+    return;
+  if (!_callbackWindow) {
+    EnterCriticalSection(&g_cs);
+    WNDCLASS wc{};
+    wc.hInstance = g_hInst;
+    wc.lpfnWndProc = CallbackProc;
+    wc.lpszClassName = WEASEL_UI_CALLBACK_CLASS;
+    if (!RegisterClass(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+      LeaveCriticalSection(&g_cs);
+      return;
+    }
+    _callbackWindow = CreateWindow(wc.lpszClassName, L"", 0, 0, 0, 0, 0,
+                                   HWND_MESSAGE, nullptr, g_hInst, this);
+    LeaveCriticalSection(&g_cs);
+  }
+  if (_callbackWindow)
+    _serverUI = _tsf->m_client.EnableServerUI(_callbackWindow);
+  if (_serverUI)
+    _ui->Destroy(true);
+}
+
+void CCandidateList::_DestroyCallbackWindow() {
+  EnterCriticalSection(&g_cs);
+  if (_callbackWindow) {
+    DestroyWindow(_callbackWindow);
+    _callbackWindow = nullptr;
+  }
+  // Fails harmlessly while another instance still owns a window of this
+  // class. The last instance removes the DLL's WndProc registration.
+  UnregisterClass(WEASEL_UI_CALLBACK_CLASS, g_hInst);
+  LeaveCriticalSection(&g_cs);
+}
+
+LRESULT CALLBACK CCandidateList::CallbackProc(HWND hwnd,
+                                              UINT msg,
+                                              WPARAM wp,
+                                              LPARAM lp) {
+  auto self =
+      reinterpret_cast<CCandidateList*>(GetWindowLongPtr(hwnd, GWLP_USERDATA));
+  if (msg == WM_NCCREATE) {
+    self = static_cast<CCandidateList*>(
+        reinterpret_cast<CREATESTRUCT*>(lp)->lpCreateParams);
+    SetWindowLongPtr(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
+  }
+  if (self && msg == WM_WEASEL_UI_CALLBACK) {
+    com_ptr<CCandidateList> keep_alive(self);
+    if (!self->_serverUI || wp != self->_uiToken)
+      return 0;
+    const auto action = static_cast<DWORD>(lp) & 0xff;
+    const auto value = static_cast<DWORD>(lp) >> 8;
+    if (action == UI_LAYOUT) {
+      if (value > 3)
+        return 0;
+      self->_remoteReposition = (value & 1) != 0;
+      self->_remoteShown = self->_visibility.visible() && (value & 2) != 0;
+      return 0;
+    }
+    if (!self->_shown ||
+        !self->_visibility.AcceptsAction(static_cast<DWORD>(wp),
+                                         self->_uiToken) ||
+        !self->_tsf->_status.composing)
+      return 0;
+    com_ptr<ITfDocumentMgr> focused, owner;
+    if (!self->_pContextDocument || !self->_tsf->_GetThreadMgr() ||
+        FAILED(self->_tsf->_GetThreadMgr()->GetFocus(&focused)) ||
+        FAILED(self->_pContextDocument->GetDocumentMgr(&owner)) ||
+        focused != owner)
+      return 0;
+    size_t index = static_cast<DWORD>(lp) >> 8;
+    bool forward = index != 0;
+    switch (lp & 0xff) {
+      case UI_SELECT:
+      case UI_HOVER:
+        if (index >= self->_ui->ctx().cinfo.candies.size())
+          return 0;
+        if ((lp & 0xff) == UI_SELECT)
+          self->_tsf->HandleUICallback(&index, nullptr, nullptr, nullptr);
+        else
+          self->_tsf->HandleUICallback(nullptr, &index, nullptr, nullptr);
+        break;
+      case UI_PAGE:
+        if (index > 1)
+          return 0;
+        self->_tsf->HandleUICallback(nullptr, nullptr, &forward, nullptr);
+        break;
+      case UI_SCROLL:
+        if (index > 1)
+          return 0;
+        self->_tsf->HandleUICallback(nullptr, nullptr, nullptr, &forward);
+        break;
+    }
+    return 0;
+  }
+  return DefWindowProc(hwnd, msg, wp, lp);
+}
 
 STDMETHODIMP CCandidateList::QueryInterface(REFIID riid, void** ppvObj) {
   if (ppvObj == nullptr) {
@@ -74,15 +182,49 @@ STDMETHODIMP CCandidateList::GetGUID(GUID* pguid) {
 }
 
 STDMETHODIMP CCandidateList::Show(BOOL showCandidateWindow) {
-  if (showCandidateWindow)
+  _visibility.SetHostAllowed(!!showCandidateWindow);
+  return _UpdateVisibility();
+}
+
+void CCandidateList::SetFocused(bool focused) {
+  _visibility.SetFocused(focused);
+  _UpdateVisibility();
+}
+
+void CCandidateList::_InvalidateUIActions() {
+  static LONG token = 0;
+  _uiToken = static_cast<DWORD>(InterlockedIncrement(&token));
+  if (!_uiToken)
+    _uiToken = static_cast<DWORD>(InterlockedIncrement(&token));
+}
+
+HRESULT CCandidateList::_UpdateVisibility() {
+  const bool show = _visibility.visible();
+  if (_serverUI) {
+    if (!show)
+      _remoteShown = false;
+    if (show != _shown ||
+        (show && (_sentToken != _uiToken || _sentRevision != _revision))) {
+      if (!_tsf->m_client.ShowServerUI(show ? _uiToken : 0, _revision))
+        return E_FAIL;
+      _sentRevision = _revision;
+      _shown = show;
+      _sentToken = show ? _uiToken : 0;
+    }
+  } else if (show) {
+    if (!_ui->hwnd())
+      _MakeUIWindow();
     _ui->Show();
-  else
+  } else {
     _ui->Hide();
+  }
   return S_OK;
 }
 
 STDMETHODIMP CCandidateList::IsShown(BOOL* pIsShow) {
-  *pIsShow = _ui->IsShown();
+  if (!pIsShow)
+    return E_INVALIDARG;
+  *pIsShow = _serverUI ? _remoteShown : _ui->IsShown();
   return S_OK;
 }
 
@@ -198,7 +340,9 @@ STDMETHODIMP CCandidateList::FinalizeExactCompositionString() {
   return E_NOTIMPL;
 }
 
-void CCandidateList::UpdateUI(const Context& ctx, const Status& status) {
+void CCandidateList::UpdateUI(const Context& ctx,
+                              const Status& status,
+                              DWORD revision) {
   if (_ui->style().inline_preedit) {
     _ui->style().client_caps |= weasel::INLINE_PREEDIT_CAPABLE;
   } else {
@@ -208,14 +352,15 @@ void CCandidateList::UpdateUI(const Context& ctx, const Status& status) {
   /// In UWP, candidate window will only be shown
   /// if it is owned by active view window
   //_UpdateOwner();
+  if (_serverUI && !(_ui->ctx() == ctx))
+    _InvalidateUIActions();
   _ui->Update(ctx, status);
-  if (_uiStarted)
+  _revision = revision;
+  _visibility.SetComposing(status.composing);
+  if (_visibility.started())
     _UpdateUIElement();
 
-  if (status.composing)
-    Show(_pbShow);
-  else
-    Show(FALSE);
+  _UpdateVisibility();
 }
 
 void CCandidateList::UpdateStyle(const UIStyle& sty) {
@@ -227,15 +372,16 @@ void CCandidateList::UpdateInputPosition(RECT const& rc) {
 }
 
 void CCandidateList::Destroy() {
-  // EndUI();
-  Show(FALSE);
+  EndUI();
   _DisposeUIWindow();
 }
 
 void CCandidateList::DestroyAll() {
-  // EndUI();
-  Show(FALSE);
+  EndUI();
   _DisposeUIWindowAll();
+  _pContextDocument = nullptr;
+  _DestroyCallbackWindow();
+  _serverUI = false;
 }
 UIStyle& CCandidateList::style() {
   // return _ui->style();
@@ -284,7 +430,7 @@ HRESULT CCandidateList::_UpdateUIElement() {
 }
 
 void CCandidateList::StartUI() {
-  if (_uiStarted)
+  if (_visibility.started())
     return;
 
   com_ptr<ITfThreadMgr> pThreadMgr = _tsf->_GetThreadMgr();
@@ -306,11 +452,13 @@ void CCandidateList::StartUI() {
                               bool* const next, bool* const scroll_next) {
       _tsf->HandleUICallback(sel, hov, next, scroll_next);
     });
-  if (FAILED(pUIElementMgr->BeginUIElement(this, &_pbShow, &uiid)))
+  BOOL show = TRUE;
+  if (FAILED(pUIElementMgr->BeginUIElement(this, &show, &uiid)))
     return;
-  _uiStarted = true;
-  // pUIElementMgr->UpdateUIElement(uiid);
-  if (_pbShow) {
+  _visibility.Begin(!!show);
+  _GetActiveWnd();
+  _InvalidateUIActions();
+  if (show && !_serverUI) {
     _ui->style() = _style;
     _MakeUIWindow();
     if (!_ui_warmed_up && _ui->hwnd() != nullptr) {
@@ -323,19 +471,18 @@ void CCandidateList::StartUI() {
 }
 
 void CCandidateList::EndUI() {
-  if (!_uiStarted)
+  if (!_visibility.started())
     return;
+  _visibility.End();
+  _UpdateVisibility();
 
   com_ptr<ITfThreadMgr> pThreadMgr = _tsf->_GetThreadMgr();
   if (pThreadMgr) {
     com_ptr<ITfUIElementMgr> emgr;
     auto hr = pThreadMgr->QueryInterface(&emgr);
-    if (FAILED(hr))
-      return;
-    if (emgr != NULL)
+    if (SUCCEEDED(hr) && emgr != NULL)
       emgr->EndUIElement(uiid);
   }
-  _uiStarted = false;
   _DisposeUIWindow();
 }
 
@@ -366,8 +513,10 @@ void CCandidateList::_MakeUIWindow() {
   _ui->Create(p);
 }
 
-void WeaselTSF::_UpdateUI(const Context& ctx, const Status& status) {
-  _cand->UpdateUI(ctx, status);
+void WeaselTSF::_UpdateUI(const Context& ctx,
+                          const Status& status,
+                          DWORD revision) {
+  _cand->UpdateUI(ctx, status, revision);
 }
 
 void WeaselTSF::_StartUI() {
@@ -379,11 +528,11 @@ void WeaselTSF::_EndUI() {
 }
 
 void WeaselTSF::_ShowUI() {
-  _cand->Show(TRUE);
+  _cand->SetFocused(true);
 }
 
 void WeaselTSF::_HideUI() {
-  _cand->Show(FALSE);
+  _cand->SetFocused(false);
 }
 
 com_ptr<ITfContext> WeaselTSF::_GetUIContextDocument() {
@@ -396,6 +545,11 @@ void WeaselTSF::_DeleteCandidateList() {
 
 void WeaselTSF::_SelectCandidateOnCurrentPage(size_t index) {
   m_client.SelectCandidateOnCurrentPage(index);
+  if (_cand->_serverUI) {
+    if (m_client.ReadState() && _pEditSessionContext)
+      _UpdateComposition(_pEditSessionContext);
+    return;
+  }
   // simulate a VK_SELECT presskey to get data back and DoEditSession
   // the simulated keycode must be the one make TranslateKeycode Non-Zero return
   // fix me: are there any better ways?

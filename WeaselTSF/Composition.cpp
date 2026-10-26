@@ -99,7 +99,8 @@ STDMETHODIMP CEndCompositionEditSession::DoEditSession(TfEditCookie ec) {
   if (!_pTextService || !_pContext)
     return S_OK;
 
-  _pTextService->_ClearCompositionDisplayAttributes(ec, _pContext);
+  _pTextService->_ClearCompositionDisplayAttributes(ec, _pContext,
+                                                    _pComposition);
 
   com_ptr<ITfRange> pCompositionRange;
   if (_clear && _pComposition->GetRange(&pCompositionRange) == S_OK)
@@ -251,7 +252,7 @@ void WeaselTSF::_FlushPendingUI() {
   auto context = std::move(_pendingUIContext);
   auto status = _pendingUIStatus;
   _hasPendingUI = false;
-  _UpdateUI(*context, status);
+  _UpdateUI(*context, status, _pendingUIRevision);
 }
 
 /* Inline Preedit */
@@ -389,14 +390,43 @@ BOOL WeaselTSF::_InsertText(com_ptr<ITfContext> pContext,
   return TRUE;
 }
 
+class CResponseEditSession : public CEditSession {
+ public:
+  CResponseEditSession(com_ptr<WeaselTSF> service,
+                       com_ptr<ITfContext> context,
+                       weasel::ResponseSnapshot response)
+      : CEditSession(service, context),
+        response_(std::move(response)),
+        activation_(service->activation()) {}
+
+  STDMETHODIMP DoEditSession(TfEditCookie ec) override {
+    return _pTextService->ApplyResponse(ec, _pContext, response_, activation_);
+  }
+
+ private:
+  const weasel::ResponseSnapshot response_;
+  const DWORD activation_;
+};
+
 void WeaselTSF::_UpdateComposition(com_ptr<ITfContext> pContext) {
-  HRESULT hr;
+  if (!pContext || !_pThreadMgr)
+    return;
+  weasel::ResponseSnapshot response;
+  response.status = _status;
+  response.style = _responseStyle;
+  if (!m_client.GetResponseData([&response](LPWSTR buffer, UINT length) {
+        return response.Parse(buffer, length);
+      }))
+    return;
 
+  _responseStyle = response.style;
+  _cand->InvalidateServerActions();
   _pEditSessionContext = pContext;
-
-  _pEditSessionContext->RequestEditSession(
-      _tfClientId, this, TF_ES_ASYNCDONTCARE | TF_ES_READWRITE, &hr);
-  _async_edit = !!(hr == TF_S_ASYNC);
+  com_ptr<CResponseEditSession> session;
+  session.Attach(new CResponseEditSession(this, pContext, std::move(response)));
+  HRESULT result = E_FAIL;
+  pContext->RequestEditSession(_tfClientId, session,
+                               TF_ES_ASYNCDONTCARE | TF_ES_READWRITE, &result);
 }
 
 /* Composition State */

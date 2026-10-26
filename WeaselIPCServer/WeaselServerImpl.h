@@ -95,6 +95,9 @@ class ServerImpl : public CWindowImpl<ServerImpl, CWindow, ServerWinTraits>
   }
 
  private:
+  // Both entry points serialize at their boundary. Never acquire the API
+  // mutex here: the pipe dispatcher already owns it.
+  LRESULT DispatchCommand(WPARAM wParam, LPARAM lParam, BOOL& handled);
   void _Finailize();
   template <typename _Resp>
   void HandlePipeMessage(PipeMessage pipe_msg, _Resp resp);

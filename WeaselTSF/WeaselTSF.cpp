@@ -62,8 +62,6 @@ STDMETHODIMP WeaselTSF::QueryInterface(REFIID riid, void** ppvObject) {
     *ppvObject = (ITfKeyEventSink*)this;
   else if (IsEqualIID(riid, IID_ITfCompositionSink))
     *ppvObject = (ITfCompositionSink*)this;
-  else if (IsEqualIID(riid, IID_ITfEditSession))
-    *ppvObject = (ITfEditSession*)this;
   else if (IsEqualIID(riid, IID_ITfThreadFocusSink))
     *ppvObject = (ITfThreadFocusSink*)this;
   else if (IsEqualIID(riid, IID_ITfDisplayAttributeProvider))
@@ -97,6 +95,11 @@ STDMETHODIMP WeaselTSF::Activate(ITfThreadMgr* pThreadMgr,
 }
 
 STDMETHODIMP WeaselTSF::Deactivate() {
+  ++_activation;
+  _pendingUIContext.reset();
+  _hasPendingUI = false;
+  // End the negotiated UI while its thread manager and IPC session exist.
+  _cand->DestroyAll();
   m_client.EndSession();
 
   _InitTextEditSink(com_ptr<ITfDocumentMgr>());
@@ -110,13 +113,12 @@ STDMETHODIMP WeaselTSF::Deactivate() {
 
   _UninitCompartment();
 
-  _UninitThreadMgrEventSink();
+  if (_pThreadMgr)
+    _UninitThreadFocusSink();
 
   _pThreadMgr = NULL;
 
   _tfClientId = TF_CLIENTID_NULL;
-
-  _cand->DestroyAll();
 
   return S_OK;
 }
@@ -125,6 +127,7 @@ STDMETHODIMP WeaselTSF::ActivateEx(ITfThreadMgr* pThreadMgr,
                                    TfClientId tfClientId,
                                    DWORD dwFlags) {
   LoadWeaselLogLevelFromRegistry();
+  ++_activation;
   com_ptr<ITfDocumentMgr> pDocMgrFocus;
   _activateFlags = dwFlags;
 
@@ -233,6 +236,8 @@ void WeaselTSF::_Reconnect() {
   if (ok) {
     _UpdateLanguageBar(_status);
   }
+  _responseStyle = _cand->style();
+  _cand->ConnectServerUI();
 }
 
 static unsigned int retry = 0;
@@ -262,12 +267,11 @@ bool WeaselTSF::_EnsureServerConnected() {
       if (!m_client.Echo() && GetLastError() != ERROR_ALREADY_EXISTS &&
           !count_server_process()) {
         std::wstring dir = _GetRootDir();
-        std::thread th([dir, this]() {
+        std::thread th([dir]() {
           ShellExecuteW(NULL, L"open", (dir + L"\\start_service.bat").c_str(),
                         NULL, dir.c_str(), SW_HIDE);
-          // wait 500ms, then reconnect
-          std::this_thread::sleep_for(std::chrono::milliseconds(500));
-          _Reconnect();
+          // Reconnect on the next input on the TSF apartment. A worker must
+          // not touch COM state or create its callback window.
         });
         th.detach();
       }

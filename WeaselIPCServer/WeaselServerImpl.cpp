@@ -4,6 +4,8 @@
 #include <Windows.h>
 #include <resource.h>
 #include <WeaselUtility.h>
+#include <ServerUIPosition.h>
+#include <ServerUIRevision.h>
 
 namespace weasel {
 class PipeServer : public PipeChannel<DWORD, PipeMessage> {
@@ -27,6 +29,7 @@ class PipeServer : public PipeChannel<DWORD, PipeMessage> {
 using namespace weasel;
 
 extern CAppModule _Module;
+static std::mutex g_api_mutex;
 
 ServerImpl::ServerImpl()
     : m_pRequestHandler(NULL),
@@ -57,6 +60,7 @@ LRESULT ServerImpl::OnColorChange(UINT uMsg,
                                   WPARAM wParam,
                                   LPARAM lParam,
                                   BOOL& bHandled) {
+  std::lock_guard guard(g_api_mutex);
   if (IsUserDarkMode() != m_darkMode) {
     m_darkMode = IsUserDarkMode();
     m_pRequestHandler->UpdateColorTheme(m_darkMode);
@@ -100,6 +104,7 @@ LRESULT ServerImpl::OnEndSystemSession(UINT uMsg,
                                        WPARAM wParam,
                                        LPARAM lParam,
                                        BOOL& bHandled) {
+  std::lock_guard guard(g_api_mutex);
   if (m_pRequestHandler) {
     m_pRequestHandler->Finalize();
     m_pRequestHandler = nullptr;
@@ -111,14 +116,25 @@ LRESULT ServerImpl::OnCommand(UINT uMsg,
                               WPARAM wParam,
                               LPARAM lParam,
                               BOOL& bHandled) {
+  std::lock_guard guard(g_api_mutex);
+  return DispatchCommand(wParam, lParam, bHandled);
+}
+
+LRESULT ServerImpl::DispatchCommand(WPARAM wParam,
+                                    LPARAM lParam,
+                                    BOOL& bHandled) {
   UINT uID = LOWORD(wParam);
   switch (uID) {
-    case ID_WEASELTRAY_ENABLE_ASCII:
-      m_pRequestHandler->SetOption(lParam, "ascii_mode", true);
+    case ID_WEASELTRAY_ENABLE_ASCII: {
+      if (m_pRequestHandler)
+        m_pRequestHandler->SetOption(lParam, "ascii_mode", true);
       return 0;
-    case ID_WEASELTRAY_DISABLE_ASCII:
-      m_pRequestHandler->SetOption(lParam, "ascii_mode", false);
+    }
+    case ID_WEASELTRAY_DISABLE_ASCII: {
+      if (m_pRequestHandler)
+        m_pRequestHandler->SetOption(lParam, "ascii_mode", false);
       return 0;
+    }
     default:;
   }
 
@@ -148,7 +164,7 @@ DWORD ServerImpl::OnCommand(WEASEL_IPC_COMMAND uMsg,
                             DWORD wParam,
                             DWORD lParam) {
   BOOL handled = TRUE;
-  OnCommand(uMsg, wParam, lParam, handled);
+  DispatchCommand(wParam, lParam, handled);
   return handled;
 }
 
@@ -177,8 +193,6 @@ int ServerImpl::Stop() {
   PostMessage(WM_QUIT);
   return 0;
 }
-
-static std::mutex g_api_mutex;
 
 int ServerImpl::Run() {
   // This workaround causes a VC internal error:
@@ -412,10 +426,50 @@ void ServerImpl::HandlePipeMessage(PipeMessage pipe_msg, _Resp resp) {
   PIPE_MSG_HANDLE(WEASEL_IPC_HIGHLIGHT_CANDIDATE_ON_CURRENT_PAGE,
                   OnHighlightCandidateOnCurrentPage);
   PIPE_MSG_HANDLE(WEASEL_IPC_CHANGE_PAGE, OnChangePage);
-  PIPE_MSG_HANDLE(WEASEL_IPC_TRAY_COMMAND, OnCommand);
-  END_MAP_PIPE_MSG_HANDLE(result);
+  case WEASEL_IPC_ENABLE_SERVER_UI:
+    if (m_pRequestHandler)
+      _result = m_pRequestHandler->EnableServerUI(
+          static_cast<HWND>(ULongToHandle(wParam)), lParam);
+    break;
+  case WEASEL_IPC_SHOW_SERVER_UI:
+    if (m_pRequestHandler && m_pRequestHandler->FindSession(lParam)) {
+      DWORD revision = 0;
+      ResponseHandler read_revision = [&revision](LPWSTR data, DWORD length) {
+        if (!data || !length)
+          return false;
+        const size_t count =
+            wcsnlen_s(data, (std::min)(size_t(length), size_t{12}));
+        if (!count || count > 11 || data[count - 1] != L'\n')
+          return false;
+        return ParseServerUIRevision(std::wstring(data, count - 1), revision);
+      };
+      if (channel->HandleResponseData(read_revision))
+        _result = m_pRequestHandler->ShowServerUI(wParam, revision, lParam);
+    }
+    break;
+  case WEASEL_IPC_READ_STATE:
+    if (m_pRequestHandler)
+      _result = m_pRequestHandler->ReadState(lParam, [this](std::wstring& msg) {
+        *channel << msg;
+        return true;
+      });
+    break;
+  case WEASEL_IPC_UPDATE_INPUT_POS_EX:
+    if (m_pRequestHandler && m_pRequestHandler->FindSession(lParam)) {
+      RECT rc{};
+      ResponseHandler read_position = [&rc](LPWSTR data, DWORD length) {
+        return DecodeServerUIPosition(data, length, rc);
+      };
+      if (channel->HandleResponseData(read_position)) {
+        m_pRequestHandler->UpdateInputPosition(rc, lParam);
+        _result = 1;
+      }
+    }
+    break;
+    PIPE_MSG_HANDLE(WEASEL_IPC_TRAY_COMMAND, OnCommand);
+    END_MAP_PIPE_MSG_HANDLE(result);
 
-  resp(result);
+    resp(result);
 }
 
 PipeServer::PipeServer(std::wstring&& pn_cmd, SECURITY_ATTRIBUTES* s)

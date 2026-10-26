@@ -3,6 +3,7 @@
 #include "Globals.h"
 #include <WeaselIPC.h>
 #include <WeaselIPCData.h>
+#include <ResponseParser.h>
 
 class CCandidateList;
 class CLangBarItemButton;
@@ -16,9 +17,9 @@ class WeaselTSF : public ITfTextInputProcessorEx,
                   public ITfCompositionSink,
                   public ITfThreadFocusSink,
                   public ITfActiveLanguageProfileNotifySink,
-                  public ITfEditSession,
                   public ITfDisplayAttributeProvider {
  public:
+  friend class CCandidateList;
   WeaselTSF();
   ~WeaselTSF();
 
@@ -85,7 +86,11 @@ class WeaselTSF : public ITfTextInputProcessorEx,
                                        ITfComposition* pComposition);
 
   /* ITfEditSession */
-  STDMETHODIMP DoEditSession(TfEditCookie ec);
+  HRESULT ApplyResponse(TfEditCookie ec,
+                        com_ptr<ITfContext> pContext,
+                        const weasel::ResponseSnapshot& response,
+                        DWORD activation);
+  DWORD activation() const { return _activation; }
 
   /* ITfActiveLanguageProfileNotifySink */
   STDMETHODIMP OnActivated(REFCLSID clsid,
@@ -136,7 +141,9 @@ class WeaselTSF : public ITfTextInputProcessorEx,
   bool _EnsureServerConnected();
 
   /* UI */
-  void _UpdateUI(const weasel::Context& ctx, const weasel::Status& status);
+  void _UpdateUI(const weasel::Context& ctx,
+                 const weasel::Status& status,
+                 DWORD revision);
   void _StartUI();
   void _EndUI();
   void _ShowUI();
@@ -145,7 +152,8 @@ class WeaselTSF : public ITfTextInputProcessorEx,
 
   /* Display Attribute */
   void _ClearCompositionDisplayAttributes(TfEditCookie ec,
-                                          _In_ ITfContext* pContext);
+                                          _In_ ITfContext* pContext,
+                                          _In_ ITfComposition* pComposition);
   BOOL _SetCompositionDisplayAttributes(TfEditCookie ec,
                                         _In_ ITfContext* pContext,
                                         ITfRange* pRangeComposition);
@@ -229,16 +237,18 @@ class WeaselTSF : public ITfTextInputProcessorEx,
   /* Weasel Related */
   weasel::Client m_client;
   DWORD _activateFlags;
+  DWORD _activation = 0;
 
   /* IME status */
   weasel::Status _status;
+  weasel::UIStyle _responseStyle;
 
   // guidatom for the display attibute.
   TfGuidAtom _gaDisplayAttributeInput;
-  BOOL _async_edit = false;
   BOOL _committed = false;
   BOOL _isToOpenClose = false;
   std::shared_ptr<weasel::Context> _pendingUIContext;
   weasel::Status _pendingUIStatus;
+  DWORD _pendingUIRevision = 0;
   bool _hasPendingUI = false;
 };

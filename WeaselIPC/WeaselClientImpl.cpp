@@ -1,6 +1,7 @@
 ﻿#include "stdafx.h"
 #include "WeaselClientImpl.h"
 #include <StringAlgorithm.hpp>
+#include <ServerUIPosition.h>
 
 using namespace weasel;
 
@@ -103,9 +104,42 @@ bool ClientImpl::ChangePage(bool backward) {
   return ret != 0;
 }
 
+bool ClientImpl::EnableServerUI(HWND callback) {
+  server_ui = _Active() &&
+              _SendMessage(WEASEL_IPC_ENABLE_SERVER_UI, HandleToUlong(callback),
+                           session_id) == WEASEL_SERVER_UI_V2;
+  return server_ui;
+}
+
+bool ClientImpl::ShowServerUI(DWORD token, DWORD revision) {
+  if (!_Active())
+    return false;
+  channel << std::to_wstring(revision) + L"\n";
+  return _SendMessage(WEASEL_IPC_SHOW_SERVER_UI, token, session_id) != 0;
+}
+
+bool ClientImpl::ReadState() {
+  return _Active() && _SendMessage(WEASEL_IPC_READ_STATE, 0, session_id) != 0;
+}
+
+bool Client::EnableServerUI(HWND callback) {
+  return m_pImpl->EnableServerUI(callback);
+}
+bool Client::ShowServerUI(DWORD token, DWORD revision) {
+  return m_pImpl->ShowServerUI(token, revision);
+}
+bool Client::ReadState() {
+  return m_pImpl->ReadState();
+}
+
 void ClientImpl::UpdateInputPosition(RECT const& rc) {
   if (!_Active())
     return;
+  if (server_ui) {
+    channel << EncodeServerUIPosition(rc);
+    _SendMessage(WEASEL_IPC_UPDATE_INPUT_POS_EX, 0, session_id);
+    return;
+  }
   /*
   移位标志 = 1bit == 0
   height:0~127 = 7bit
@@ -152,6 +186,7 @@ void ClientImpl::StartSession() {
 }
 
 void ClientImpl::EndSession() {
+  server_ui = false;
   _SendMessage(WEASEL_IPC_END_SESSION, 0, session_id);
   session_id = 0;
 }

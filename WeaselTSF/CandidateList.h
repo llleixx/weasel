@@ -1,5 +1,6 @@
 #pragma once
 #include <WeaselUI.h>
+#include <CandidateUIState.h>
 #include "ctffunc.h"
 
 class WeaselTSF;
@@ -7,6 +8,7 @@ class WeaselTSF;
 class CCandidateList : public ITfIntegratableCandidateListUIElement,
                        public ITfCandidateListUIElementBehavior {
  public:
+  friend class WeaselTSF;
   CCandidateList(com_ptr<WeaselTSF> pTextService);
   ~CCandidateList();
 
@@ -47,16 +49,23 @@ class CCandidateList : public ITfIntegratableCandidateListUIElement,
   STDMETHODIMP FinalizeExactCompositionString();
 
   /* Update */
-  void UpdateUI(const weasel::Context& ctx, const weasel::Status& status);
+  void InvalidateServerActions() { _InvalidateUIActions(); }
+  void UpdateUI(const weasel::Context& ctx,
+                const weasel::Status& status,
+                DWORD revision);
   void UpdateStyle(const weasel::UIStyle& sty);
   void UpdateInputPosition(RECT const& rc);
   void Destroy();
   void DestroyAll();
   void StartUI();
   void EndUI();
+  void ConnectServerUI();
+  void SetFocused(bool focused);
 
   com_ptr<ITfContext> GetContextDocument();
   bool GetIsReposition() {
+    if (_serverUI)
+      return _remoteReposition;
     if (_ui)
       return _ui->GetIsReposition();
     else
@@ -66,6 +75,19 @@ class CCandidateList : public ITfIntegratableCandidateListUIElement,
   weasel::UIStyle& style();
 
  private:
+  static LRESULT CALLBACK CallbackProc(HWND, UINT, WPARAM, LPARAM);
+  HWND _callbackWindow = nullptr;
+  bool _serverUI = false;
+  bool _shown = false;
+  DWORD _uiToken = 0;
+  bool _remoteReposition = false;
+  bool _remoteShown = false;
+  DWORD _sentToken = 0;
+  DWORD _revision = 0;
+  DWORD _sentRevision = 0;
+  HRESULT _UpdateVisibility();
+  void _InvalidateUIActions();
+  void _DestroyCallbackWindow();
   // void _UpdateOwner();
   HWND _GetActiveWnd();
   HRESULT _UpdateUIElement();
@@ -84,8 +106,7 @@ class CCandidateList : public ITfIntegratableCandidateListUIElement,
   TfIntegratableCandidateListSelectionStyle _selectionStyle =
       STYLE_ACTIVE_SELECTION;
 
-  BOOL _pbShow;
-  bool _uiStarted = false;
+  weasel::CandidateUIState _visibility;
   weasel::UIStyle _style;
   bool _ui_warmed_up = false;
 

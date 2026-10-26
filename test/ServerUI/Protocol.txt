@@ -1,0 +1,47 @@
+Server candidate UI: ownership and protocol
+
+Desktop TSF clients negotiate WEASEL_SERVER_UI_V2 using a message-only
+window of class WeaselCandidateCallback.v2. The server validates the class
+and probes PostMessage before returning the version. Unrecognized peers,
+immersive hosts and a blocked callback channel retain local rendering.
+The engine stays in WeaselServer; no executable-name exception is used.
+
+The pipe worker owns the mutable UI model under g_api_mutex. The window
+thread owns the presenter and all DirectComposition/Direct2D resources.
+UI::UpdateBatch publishes one complete snapshot, using PostMessage rather
+than waiting for the window thread. Callback closures capture values only.
+Native command entry acquires g_api_mutex; IPC dispatch already owns it.
+
+Each negotiated engine response contains ui_revision=<nonzero DWORD>.
+The client copies commit/context/status/config/style/revision before asking
+TSF for an edit lock. Each deferred edit retains its own ITfContext and
+activation generation. Style defaults follow received responses, not the
+last edit that TSF happened to execute. Deactivation invalidates old edits.
+
+The client preserves upstream's caret-before-candidate publication. After
+receiving the text extent, it sends full signed RECT coordinates and a
+SHOW_SERVER_UI request: wParam is the action token, lParam is the session,
+and the shared text payload is the decimal response revision plus newline.
+Token zero hides. A nonzero token is accepted only for the active session's
+current response revision. Until acknowledged, the server keeps the last
+published candidate frame; it does not combine new candidates with an old
+action token. Position-only updates are also held until acknowledgement.
+
+Callbacks use the token in wParam. The low byte of lParam is the action,
+and the upper 24 bits are its value. UI_LAYOUT uses bit 0 for reversed
+layout and bit 1 for actual visibility. Client callbacks require current
+token, composition, host permission and focused owner document. Candidate
+indices and Boolean actions are range checked. Receiving a new response
+invalidates old actions even before TSF grants the edit lock.
+
+Host Show(FALSE), document focus and composition are separate state inputs.
+Internal hides do not overwrite the host's policy. Inactive backend
+sessions cannot replace the shared presenter. Endpoint destruction hides
+the presenter at the next 200 ms lifetime observation; this is not an
+instantaneous process-death guarantee.
+
+The unchanged legacy position command retains its existing packed format.
+The negotiated command carries four signed 32-bit screen coordinates.
+Mixed-DPI placement, real TSF asynchronous edit ordering, host-owned UI,
+elevated-host fallback, reconnect and mixed binaries still require real
+application integration tests. The focused tests here cannot certify them.

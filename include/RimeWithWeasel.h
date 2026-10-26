@@ -1,5 +1,6 @@
 #pragma once
 #include <WeaselIPC.h>
+#include <ServerUIRevision.h>
 #include <WeaselUI.h>
 #include <map>
 #include <string>
@@ -30,6 +31,12 @@ struct SessionStatus {
   RimeStatus status;
   bool __synced;
   RimeSessionId session_id;
+  HWND ui_callback = nullptr;
+  DWORD ui_token = 0;
+  weasel::ServerUIRevision ui_revision;
+  weasel::Context ui_context;
+  RECT input_position{};
+  bool has_input_position = false;
 };
 typedef std::map<DWORD, SessionStatus> SessionStatusMap;
 typedef DWORD WeaselSessionId;
@@ -68,6 +75,9 @@ class RimeWithWeaselHandler : public weasel::RequestHandler {
                          const std::string& opt,
                          bool val);
   virtual void UpdateColorTheme(BOOL darkMode);
+  DWORD EnableServerUI(HWND callback, DWORD ipc_id) override;
+  bool ShowServerUI(DWORD token, DWORD revision, DWORD ipc_id) override;
+  bool ReadState(DWORD ipc_id, EatLine eat) override;
 
   void OnUpdateUI(std::function<void()> const& cb);
 
@@ -92,7 +102,8 @@ class RimeWithWeaselHandler : public weasel::RequestHandler {
   void _UpdateInlinePreeditStatus(WeaselSessionId ipc_id);
 
   RimeSessionId to_session_id(WeaselSessionId ipc_id) {
-    return m_session_status_map[ipc_id].session_id;
+    const auto it = m_session_status_map.find(ipc_id);
+    return it != m_session_status_map.end() ? it->second.session_id : 0;
   }
   SessionStatus& get_session_status(WeaselSessionId ipc_id) {
     return m_session_status_map[ipc_id];
